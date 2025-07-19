@@ -1,0 +1,38 @@
+# Web Scraping and RAG Storage Requirements
+
+# Core dependencies
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+html5lib>=1.1
+
+# Vector Database
+pinecone-client>=3.0.0
+
+# AI/ML - Ollama by default, OpenAI as fallback
+ollama>=0.2.0
+openai>=1.0.0
+
+# Web automation for dynamic content
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# PDF processing
+PyPDF2>=3.0.0
+pdfplumber>=0.9.0
+
+# Utilities
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Optional: For better text processing
+nltk>=3.8
+spacy>=3.7.0
+
+# Optional: For advanced content extraction
+readability>=0.3.1
+newspaper3k>=0.2.8
