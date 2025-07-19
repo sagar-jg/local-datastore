@@ -1,0 +1,16 @@
+# Example URLs file for batch scraping
+# Add one URL per line, comments start with #
+
+# Documentation sites
+https://docs.python.org/3/tutorial/
+https://fastapi.tiangolo.com/
+
+# Blog posts
+https://realpython.com/python-web-scraping-practical-introduction/
+
+# API documentation
+https://jsonplaceholder.typicode.com/
+
+# Add your URLs here...
+# https://your-website.com
+# https://your-docs.com
