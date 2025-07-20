@@ -25,7 +25,7 @@ import json
 import time
 import re
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 import logging
 from dataclasses import dataclass
 import os
@@ -106,6 +106,7 @@ class ContextAwareWebScraper:
         # Chunk settings based on PDF best practices
         self.max_chunk_size = 800  # Optimal for context retention
         self.chunk_overlap = 100   # Prevent context loss
+        self.min_chunk_size = 100  # Minimum meaningful chunk size
         
         # Model configurations
         self.embedding_model = "nomic-embed-text" if use_ollama else "text-embedding-3-large"
@@ -152,6 +153,29 @@ class ContextAwareWebScraper:
         text = re.sub(r'[–—]', '-', text)
         
         return text
+    
+    def remove_duplicate_sentences(self, text: str) -> str:
+        """Remove duplicate sentences from text to improve quality"""
+        if not text:
+            return ""
+        
+        # Split into sentences
+        sentences = re.split(r'[.!?]+', text)
+        
+        # Clean and deduplicate
+        seen_sentences = set()
+        unique_sentences = []
+        
+        for sentence in sentences:
+            cleaned = self.clean_text(sentence)
+            if cleaned and len(cleaned) > 10:  # Only keep meaningful sentences
+                # Create a normalized version for comparison
+                normalized = re.sub(r'\s+', ' ', cleaned.lower().strip())
+                if normalized not in seen_sentences:
+                    seen_sentences.add(normalized)
+                    unique_sentences.append(cleaned)
+        
+        return '. '.join(unique_sentences) + ('.' if unique_sentences else '')
     
     def generate_embeddings(self, text: str) -> List[float]:
         """Generate embeddings using Ollama or OpenAI"""
@@ -316,13 +340,15 @@ Summary:"""
     def extract_links_and_media(self, soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
         """Extract all relevant links and media for context"""
         links = []
+        seen_urls = set()  # Prevent duplicate links
         
         # Extract regular links
         for link in soup.find_all('a', href=True):
             href = link.get('href')
             text = self.clean_text(link.get_text().strip())
-            if href and text:
+            if href and text and href not in seen_urls:
                 full_url = urljoin(base_url, href)
+                seen_urls.add(href)
                 links.append({
                     'type': 'link',
                     'url': full_url,
@@ -333,40 +359,31 @@ Summary:"""
         # Extract PDFs
         for link in soup.find_all('a', href=re.compile(r'\.pdf$', re.I)):
             href = link.get('href')
-            text = self.clean_text(link.get_text().strip())
-            full_url = urljoin(base_url, href)
-            links.append({
-                'type': 'pdf',
-                'url': full_url,
-                'text': text or 'PDF Document',
-                'context': 'PDF resource'
-            })
+            if href not in seen_urls:
+                text = self.clean_text(link.get_text().strip())
+                full_url = urljoin(base_url, href)
+                seen_urls.add(href)
+                links.append({
+                    'type': 'pdf',
+                    'url': full_url,
+                    'text': text or 'PDF Document',
+                    'context': 'PDF resource'
+                })
         
         # Extract YouTube links
         for link in soup.find_all('a', href=re.compile(r'youtube\.com|youtu\.be', re.I)):
             href = link.get('href')
-            text = self.clean_text(link.get_text().strip())
-            links.append({
-                'type': 'youtube',
-                'url': href,
-                'text': text or 'YouTube Video',
-                'context': 'Video content'
-            })
-        
-        # Extract images with context
-        for img in soup.find_all('img', src=True):
-            src = img.get('src')
-            alt = self.clean_text(img.get('alt', ''))
-            if src:
-                full_url = urljoin(base_url, src)
+            if href not in seen_urls:
+                text = self.clean_text(link.get_text().strip())
+                seen_urls.add(href)
                 links.append({
-                    'type': 'image',
-                    'url': full_url,
-                    'text': alt or 'Image',
-                    'context': 'Visual content'
+                    'type': 'youtube',
+                    'url': href,
+                    'text': text or 'YouTube Video',
+                    'context': 'Video content'
                 })
         
-        return links[:20]  # Limit to top 20 links to avoid noise
+        return links[:10]  # Limit to top 10 links to avoid noise
     
     def extract_header_hierarchy(self, element, soup: BeautifulSoup) -> List[str]:
         """Extract header hierarchy for context preservation"""
@@ -418,21 +435,28 @@ Summary:"""
         if not main_content:
             main_content = soup
         
-        # Get all text content with structure
+        # Get all text content with structure, avoiding duplicates
         content_blocks = []
+        seen_content = set()
+        
         for element in main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'div']):
             raw_text = element.get_text().strip()
             cleaned_text = self.clean_text(raw_text)
             
             if cleaned_text and len(cleaned_text) > 20:  # Filter out short/empty content
-                headers = self.extract_header_hierarchy(element, soup)
-                content_blocks.append({
-                    'text': cleaned_text,
-                    'headers': headers,
-                    'tag': element.name
-                })
+                # Create normalized version for duplicate detection
+                normalized = re.sub(r'\s+', ' ', cleaned_text.lower().strip())
+                
+                if normalized not in seen_content:
+                    seen_content.add(normalized)
+                    headers = self.extract_header_hierarchy(element, soup)
+                    content_blocks.append({
+                        'text': cleaned_text,
+                        'headers': headers,
+                        'tag': element.name
+                    })
         
-        # Create chunks with overlap
+        # Create chunks with overlap and deduplication
         chunks = []
         current_chunk = ""
         current_headers = []
@@ -447,13 +471,51 @@ Summary:"""
             potential_chunk = self.clean_text(potential_chunk)
             
             if len(potential_chunk) > self.max_chunk_size and current_chunk:
-                # Create chunk with current content
+                # Deduplicate current chunk before creating
+                current_chunk = self.remove_duplicate_sentences(current_chunk)
+                
+                # Only create chunk if it meets minimum size requirement
+                if len(current_chunk) >= self.min_chunk_size:
+                    chunk_id = self.generate_chunk_id(url, chunk_index)
+                    
+                    # Generate context summary
+                    context_summary = self.generate_context_summary(current_chunk, page_summary)
+                    
+                    chunk = ContentChunk(
+                        content=current_chunk,
+                        chunk_id=chunk_id,
+                        url=url,
+                        title=page_title_text,
+                        headers_path=current_headers,
+                        content_type="web_content",
+                        links=links_and_media,
+                        chunk_index=chunk_index,
+                        total_chunks=0,  # Will update later
+                        context_summary=context_summary,
+                        page_summary=page_summary
+                    )
+                    
+                    chunks.append(chunk)
+                    chunk_index += 1
+                
+                # Start new chunk with overlap
+                overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                current_chunk = self.clean_text(overlap_text + " " + block_text)
+                current_headers = block_headers
+            else:
+                # Add to current chunk
+                current_chunk = potential_chunk
+                
+                # Update headers if this block has them
+                if block_headers:
+                    current_headers = block_headers
+        
+        # Add final chunk if there's content
+        if current_chunk and current_chunk.strip():
+            current_chunk = self.remove_duplicate_sentences(current_chunk)
+            
+            if len(current_chunk) >= self.min_chunk_size:
                 chunk_id = self.generate_chunk_id(url, chunk_index)
-                
-                # Final cleaning of current chunk
-                current_chunk = self.clean_text(current_chunk)
-                
-                # Generate context summary
                 context_summary = self.generate_context_summary(current_chunk, page_summary)
                 
                 chunk = ContentChunk(
@@ -465,47 +527,12 @@ Summary:"""
                     content_type="web_content",
                     links=links_and_media,
                     chunk_index=chunk_index,
-                    total_chunks=0,  # Will update later
+                    total_chunks=len(chunks) + 1,
                     context_summary=context_summary,
                     page_summary=page_summary
                 )
                 
                 chunks.append(chunk)
-                
-                # Start new chunk with overlap
-                overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
-                current_chunk = self.clean_text(overlap_text + " " + block_text)
-                current_headers = block_headers
-                chunk_index += 1
-            else:
-                # Add to current chunk
-                current_chunk = potential_chunk
-                
-                # Update headers if this block has them
-                if block_headers:
-                    current_headers = block_headers
-        
-        # Add final chunk if there's content
-        if current_chunk and current_chunk.strip():
-            chunk_id = self.generate_chunk_id(url, chunk_index)
-            current_chunk = self.clean_text(current_chunk)
-            context_summary = self.generate_context_summary(current_chunk, page_summary)
-            
-            chunk = ContentChunk(
-                content=current_chunk,
-                chunk_id=chunk_id,
-                url=url,
-                title=page_title_text,
-                headers_path=current_headers,
-                content_type="web_content",
-                links=links_and_media,
-                chunk_index=chunk_index,
-                total_chunks=len(chunks) + 1,
-                context_summary=context_summary,
-                page_summary=page_summary
-            )
-            
-            chunks.append(chunk)
         
         # Update total_chunks for all chunks
         total_chunks = len(chunks)
@@ -542,6 +569,15 @@ Summary:"""
         
         return " ".join(context_parts)
     
+    def safe_json_serialize(self, obj: Any) -> str:
+        """Safely serialize objects to JSON, handling special characters"""
+        try:
+            return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+        except (TypeError, ValueError) as e:
+            logger.warning(f"JSON serialization failed: {e}")
+            # Fallback to string representation
+            return str(obj)
+    
     def store_in_pinecone(self, chunks: List[ContentChunk]):
         """Store chunks in Pinecone with metadata optimized for retrieval"""
         
@@ -566,7 +602,7 @@ Summary:"""
                     "total_chunks": chunk.total_chunks,
                     "context_summary": chunk.context_summary,
                     "page_summary": chunk.page_summary,
-                    "links": json.dumps(chunk.links[:5]),  # Top 5 links only
+                    "links": self.safe_json_serialize(chunk.links[:5]),  # Top 5 links only, safely serialized
                     "scraped_at": datetime.now().isoformat(),
                     "domain": urlparse(chunk.url).netloc
                 }
