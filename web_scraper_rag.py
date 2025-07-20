@@ -127,6 +127,32 @@ class ContextAwareWebScraper:
             logger.warning(f"Selenium setup failed: {e}. Will use requests only.")
             self.driver = None
     
+    def clean_text(self, text: str) -> str:
+        """Clean and normalize text content"""
+        if not text:
+            return ""
+        
+        # Remove HTML entities
+        text = re.sub(r'&[a-zA-Z0-9#]+;', ' ', text)
+        
+        # Replace multiple newlines with single space
+        text = re.sub(r'\n+', ' ', text)
+        
+        # Replace multiple spaces/tabs with single space
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove extra whitespace at start and end
+        text = text.strip()
+        
+        # Remove backslashes unless they're meaningful (like URLs)
+        text = re.sub(r'\\(?![/\\])', '', text)
+        
+        # Clean up quotes and special characters
+        text = re.sub(r'[""''`]', '"', text)
+        text = re.sub(r'[–—]', '-', text)
+        
+        return text
+    
     def generate_embeddings(self, text: str) -> List[float]:
         """Generate embeddings using Ollama or OpenAI"""
         try:
@@ -212,15 +238,19 @@ Summary:"""
         """Generate page-level summary for context"""
         title = soup.find('title')
         title_text = title.get_text().strip() if title else "No title"
+        title_text = self.clean_text(title_text)
         
         # Get meta description
         meta_desc = soup.find('meta', attrs={'name': 'description'})
         description = meta_desc.get('content', '') if meta_desc else ''
+        description = self.clean_text(description)
         
         # Get main headings
         headings = []
         for h in soup.find_all(['h1', 'h2', 'h3'], limit=5):
-            headings.append(h.get_text().strip())
+            heading_text = self.clean_text(h.get_text().strip())
+            if heading_text:
+                headings.append(heading_text)
         
         summary = f"Page: {title_text}"
         if description:
@@ -228,7 +258,7 @@ Summary:"""
         if headings:
             summary += f" - Main sections: {', '.join(headings)}"
         
-        return summary
+        return self.clean_text(summary)
     
     def extract_content_with_context(self, url: str) -> Tuple[BeautifulSoup, str]:
         """Extract content using both requests and Selenium if needed"""
@@ -290,7 +320,7 @@ Summary:"""
         # Extract regular links
         for link in soup.find_all('a', href=True):
             href = link.get('href')
-            text = link.get_text().strip()
+            text = self.clean_text(link.get_text().strip())
             if href and text:
                 full_url = urljoin(base_url, href)
                 links.append({
@@ -303,7 +333,7 @@ Summary:"""
         # Extract PDFs
         for link in soup.find_all('a', href=re.compile(r'\.pdf$', re.I)):
             href = link.get('href')
-            text = link.get_text().strip()
+            text = self.clean_text(link.get_text().strip())
             full_url = urljoin(base_url, href)
             links.append({
                 'type': 'pdf',
@@ -315,7 +345,7 @@ Summary:"""
         # Extract YouTube links
         for link in soup.find_all('a', href=re.compile(r'youtube\.com|youtu\.be', re.I)):
             href = link.get('href')
-            text = link.get_text().strip()
+            text = self.clean_text(link.get_text().strip())
             links.append({
                 'type': 'youtube',
                 'url': href,
@@ -326,7 +356,7 @@ Summary:"""
         # Extract images with context
         for img in soup.find_all('img', src=True):
             src = img.get('src')
-            alt = img.get('alt', '')
+            alt = self.clean_text(img.get('alt', ''))
             if src:
                 full_url = urljoin(base_url, src)
                 links.append({
@@ -348,15 +378,15 @@ Summary:"""
         # Build header stack
         header_stack = []
         for header in all_headers:
-            if header.get_text().strip():
+            header_text = self.clean_text(header.get_text().strip())
+            if header_text:
                 level = int(header.name[1])
-                text = header.get_text().strip()
                 
                 # Maintain hierarchy
                 while header_stack and header_stack[-1]['level'] >= level:
                     header_stack.pop()
                 
-                header_stack.append({'level': level, 'text': text})
+                header_stack.append({'level': level, 'text': header_text})
                 
                 # If this header comes before our element, it's part of our context
                 try:
@@ -377,7 +407,7 @@ Summary:"""
         
         # Get page-level context
         page_title = soup.find('title')
-        page_title_text = page_title.get_text().strip() if page_title else urlparse(url).netloc
+        page_title_text = self.clean_text(page_title.get_text().strip()) if page_title else urlparse(url).netloc
         
         page_summary = self.get_page_summary(soup, url)
         links_and_media = self.extract_links_and_media(soup, url)
@@ -391,11 +421,13 @@ Summary:"""
         # Get all text content with structure
         content_blocks = []
         for element in main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'div']):
-            text = element.get_text().strip()
-            if text and len(text) > 20:  # Filter out short/empty content
+            raw_text = element.get_text().strip()
+            cleaned_text = self.clean_text(raw_text)
+            
+            if cleaned_text and len(cleaned_text) > 20:  # Filter out short/empty content
                 headers = self.extract_header_hierarchy(element, soup)
                 content_blocks.append({
-                    'text': text,
+                    'text': cleaned_text,
                     'headers': headers,
                     'tag': element.name
                 })
@@ -411,9 +443,15 @@ Summary:"""
             block_headers = block['headers']
             
             # Check if adding this block would exceed chunk size
-            if len(current_chunk + " " + block_text) > self.max_chunk_size and current_chunk:
+            potential_chunk = current_chunk + " " + block_text if current_chunk else block_text
+            potential_chunk = self.clean_text(potential_chunk)
+            
+            if len(potential_chunk) > self.max_chunk_size and current_chunk:
                 # Create chunk with current content
                 chunk_id = self.generate_chunk_id(url, chunk_index)
+                
+                # Final cleaning of current chunk
+                current_chunk = self.clean_text(current_chunk)
                 
                 # Generate context summary
                 context_summary = self.generate_context_summary(current_chunk, page_summary)
@@ -436,23 +474,21 @@ Summary:"""
                 
                 # Start new chunk with overlap
                 overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
-                current_chunk = overlap_text + " " + block_text
+                current_chunk = self.clean_text(overlap_text + " " + block_text)
                 current_headers = block_headers
                 chunk_index += 1
             else:
                 # Add to current chunk
-                if current_chunk:
-                    current_chunk += " " + block_text
-                else:
-                    current_chunk = block_text
+                current_chunk = potential_chunk
                 
                 # Update headers if this block has them
                 if block_headers:
                     current_headers = block_headers
         
         # Add final chunk if there's content
-        if current_chunk.strip():
+        if current_chunk and current_chunk.strip():
             chunk_id = self.generate_chunk_id(url, chunk_index)
+            current_chunk = self.clean_text(current_chunk)
             context_summary = self.generate_context_summary(current_chunk, page_summary)
             
             chunk = ContentChunk(
@@ -491,20 +527,20 @@ Summary:"""
         context_parts = []
         
         # File/Page summary
-        context_parts.append(f"<page_summary>\n{chunk.page_summary}\n</page_summary>")
+        context_parts.append(f"<page_summary>{chunk.page_summary}</page_summary>")
         
         # Chunk summary
-        context_parts.append(f"<chunk_summary>\n{chunk.context_summary}\n</chunk_summary>")
+        context_parts.append(f"<chunk_summary>{chunk.context_summary}</chunk_summary>")
         
         # Headers hierarchy
         if chunk.headers_path:
             headers_str = " > ".join(chunk.headers_path)
-            context_parts.append(f"<headers>\n{headers_str}\n</headers>")
+            context_parts.append(f"<headers>{headers_str}</headers>")
         
         # Main content
-        context_parts.append(f"<content>\n{chunk.content}\n</content>")
+        context_parts.append(f"<content>{chunk.content}</content>")
         
-        return "\n\n".join(context_parts)
+        return " ".join(context_parts)
     
     def store_in_pinecone(self, chunks: List[ContentChunk]):
         """Store chunks in Pinecone with metadata optimized for retrieval"""
